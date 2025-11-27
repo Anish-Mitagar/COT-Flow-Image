@@ -17,7 +17,7 @@ class MNISTWithFourier(torch.utils.data.Dataset):
     def __getitem__(self, index):
         img, target = self.mnist[index]
         #print(img.shape, 'img.shape in mnist') #1,28,28
-        fourier_img = torch.fft.fft2(img)
+        fourier_img = torch.fft.fftshift(torch.fft.fft2(img)) #torch.fft.fft2(img)
         noise = self.noise_level * torch.randn_like(fourier_img)
         fourier_img = fourier_img + noise
         return img, fourier_img, target
