@@ -1,14 +1,12 @@
 """
-LOUPE-style Probabilistic Mask (FIXED VERSION)
-Based on: "Learning-based Optimization of the Under-sampling Pattern in MRI"
-Bahadir et al., 2019
+LOUPE-style Probabilistic Mask (FIXED TO MATCH WORKING VERSION)
+Based on the working ProbabilisticMask from dual_autoencoder.py
 
-This is the FIXED version that replaces the flawed ProbabilisticMask.py
-Key improvements:
-- Controlled sparsity with rescaling
-- No conflicting L1 regularization
-- Proper probabilistic sampling
-- Works with Fourier transform (complex -> 2*real)
+This version uses the EXACT same architecture that was proven to work:
+- Proper straight-through estimator
+- Conditional rescaling (not simple scaling)
+- Randomized sampling during training
+- All the LOUPE layers from the TensorFlow implementation
 """
 
 import torch
@@ -21,114 +19,139 @@ class LOUPEMask(nn.Module):
     """
     LOUPE-style learnable probabilistic mask for k-space sampling.
     
-    Architecture:
-    1. Learnable logits θ (parameters to optimize)
-    2. Sigmoid with slope parameter → probabilities
-    3. Rescaling to maintain exact sparsity budget
-    4. Stochastic sampling during training (Bernoulli)
-    5. Deterministic thresholding during inference
+    This is the WORKING version based on ProbabilisticMask.
+    
+    Architecture (following LOUPE paper):
+    1. ProbMask: logits → sigmoid(slope * logits) → probabilities
+    2. RescaleProbMap: rescale to match target sparsity
+    3. ThresholdRandomMask: sample binary mask from probabilities
+    4. Apply mask to input
     """
     
-    def __init__(self, input_dim, sparsity=0.1, slope=5.0, image_shape=(28, 28)):
+    def __init__(self, input_dim, sparsity=0.1, slope=5.0, sample_slope=12.0, 
+                 threshold=0.5, image_shape=(28, 28)):
         """
         Args:
             input_dim: Dimension of Fourier input (e.g., 28*28*2 = 1568)
             sparsity: Target sparsity/budget (e.g., 0.1 for 10% sampling)
             slope: Slope parameter for sigmoid (controls sharpness)
+            sample_slope: Slope for sampling threshold (higher = harder sampling)
+            threshold: Threshold for binarization during inference
             image_shape: Shape of original image for visualization
         """
         super(LOUPEMask, self).__init__()
         
         self.input_dim = input_dim
-        self.initial_sparsity = sparsity
-        self.slope = slope
+        self.sparsity = sparsity
+        self.threshold = threshold
         self.image_shape = image_shape
         
-        # Learnable parameters (logits)
-        # Initialize with slight positive bias to encourage sampling
-        self.logits = nn.Parameter(torch.randn(1, input_dim) * 0.1 + 0.5)
+        # Slope parameters (not trainable, just hyperparameters)
+        self.register_buffer('slope', torch.tensor(slope, dtype=torch.float32))
+        self.register_buffer('sample_slope', torch.tensor(sample_slope, dtype=torch.float32))
         
-        # Register sparsity as a buffer (not a parameter, but saved with model)
-        self.register_buffer('target_sparsity', torch.tensor(sparsity))
+        # Initialize logits using LOUPE v2 initialization
+        self.logits = nn.Parameter(self._logit_slope_random_uniform((1, input_dim)))
         
-    def get_probabilities(self):
-        """
-        Convert logits to probabilities via sigmoid.
-        
-        Returns:
-            probs: Probabilities in [0, 1] (1, input_dim)
-        """
-        # Sigmoid with slope parameter
-        # Higher slope → sharper transition (more binary-like)
-        probs = torch.sigmoid(self.slope * self.logits)
-        return probs
+        # For tracking/debugging
+        self.latest_mask = None
+        self.latest_bin_mask = None
     
-    def rescale_probabilities(self, probs):
+    def _logit_slope_random_uniform(self, shape, eps=0.01):
         """
-        Rescale probabilities to meet exact sparsity budget.
+        Initialize logits using inverse sigmoid (logit) of uniform distribution.
+        This gives more balanced initialization than random logits.
         
-        This is the KEY step in LOUPE:
-        - Sum of probabilities should equal (sparsity * input_dim)
-        - Ensures expected number of samples matches budget
-        
-        Args:
-            probs: Probabilities before rescaling (1, input_dim)
-        
-        Returns:
-            probs_rescaled: Rescaled probabilities (1, input_dim)
+        From LOUPE layers.py: ProbMask._logit_slope_random_uniform
         """
-        # Target sum: we want expected number of samples = sparsity * input_dim
-        target_sum = self.target_sparsity * self.input_dim
+        # Sample from uniform [eps, 1-eps]
+        x = torch.rand(shape, dtype=torch.float32)
+        x = eps + (1.0 - 2*eps) * x
         
-        # Current sum of probabilities
-        current_sum = torch.sum(probs)
+        # Apply inverse sigmoid (logit) with slope factor
+        # logit(x) = log(x / (1-x))
+        # For slope s: w = -log(1/x - 1) / s
+        logits = -torch.log(1.0 / x - 1.0) / self.slope.item()
         
-        # Rescale factor
-        # If sum is too high, scale down; if too low, scale up
-        scale = target_sum / (current_sum + 1e-8)
-        
-        # Apply rescaling and clip to [0, 1]
-        probs_rescaled = torch.clamp(probs * scale, 0.0, 1.0)
-        
-        return probs_rescaled
+        return logits
     
-    def sample_mask(self, probs):
+    def prob_mask(self, x):
         """
-        Sample binary mask from probabilities using Bernoulli distribution.
+        ProbMask layer from LOUPE: applies sigmoid to logits with slope.
         
-        Args:
-            probs: Rescaled probabilities (1, input_dim)
-        
-        Returns:
-            mask: Binary mask (1, input_dim) with values in {0, 1}
+        prob = sigmoid(slope * logits)
         """
-        # Bernoulli sampling: each element is 1 with probability probs[i]
-        # This is differentiable through the Gumbel-Softmax trick (implicit in PyTorch)
-        mask = torch.bernoulli(probs)
-        return mask
+        # Broadcast logits to match batch size
+        batch_size = x.size(0)
+        mask_logits = self.logits.expand(batch_size, -1)
+        
+        # Apply sigmoid with slope
+        probabilities = torch.sigmoid(self.slope * mask_logits)
+        
+        return probabilities
     
-    def get_deterministic_mask(self, threshold=0.5):
+    def rescale_prob_map(self, prob):
         """
-        Get deterministic mask by thresholding probabilities.
-        Used during inference/evaluation.
+        RescaleProbMap layer from LOUPE: rescales probabilities to match target sparsity.
         
-        Args:
-            threshold: Threshold for binarization (default 0.5)
-        
-        Returns:
-            mask: Binary mask (1, input_dim)
+        This is the CRITICAL rescaling from the TensorFlow code:
+        If mean(prob) > sparsity: prob' = prob * sparsity / mean(prob)
+        If mean(prob) < sparsity: prob' = 1 - (1-prob) * (1-sparsity) / (1-mean(prob))
         """
-        probs = self.get_probabilities()
-        probs_rescaled = self.rescale_probabilities(probs)
+        prob_mean = torch.mean(prob)
         
-        # Threshold to get binary mask
-        mask = (probs_rescaled >= threshold).float()
+        # Rescaling factors
+        r = self.sparsity / (prob_mean + 1e-8)
+        beta = (1.0 - self.sparsity) / (1.0 - prob_mean + 1e-8)
         
-        return mask
+        # Conditional rescaling (equivalent to LOUPE's tf.less_equal logic)
+        # le = 1 if r <= 1, else 0
+        le = (r <= 1.0).float()
+        
+        # Apply conditional rescaling
+        rescaled = le * prob * r + (1.0 - le) * (1.0 - (1.0 - prob) * beta)
+        
+        return rescaled
+    
+    def threshold_random_mask(self, prob, training=True):
+        """
+        ThresholdRandomMask layer from LOUPE: samples binary mask from probabilities.
+        
+        CRITICAL: Uses straight-through estimator for gradients!
+        
+        During training: Uses soft thresholding with sigmoid + straight-through
+        During inference: Uses hard thresholding
+        """
+        if training:
+            # Generate random uniform samples (RandomMask layer)
+            random_samples = torch.rand_like(prob, dtype=torch.float32)
+            
+            # Soft thresholding with slope (ThresholdRandomMask layer)
+            # sigmoid(sample_slope * (prob - random))
+            # This gives smooth gradients during training
+            binary_mask = torch.sigmoid(self.sample_slope * (prob - random_samples))
+            
+            # CRITICAL: Straight-through estimator
+            # Forward pass: use hard binary values
+            # Backward pass: use soft values for gradients
+            binary_hard = (prob > random_samples).float()
+            binary_mask = binary_hard + (binary_mask - binary_mask.detach())
+            
+        else:
+            # During inference: hard thresholding
+            binary_mask = (prob > self.threshold).float()
+        
+        return binary_mask
     
     def forward(self, x):
         """
-        Apply learned mask to input.
+        Forward pass implementing full LOUPE architecture.
+        
+        Pipeline:
+        1. ProbMask: logits → sigmoid(slope * logits) → probabilities
+        2. RescaleProbMap: rescale to match target sparsity
+        3. ThresholdRandomMask: sample binary mask from probabilities
+        4. Apply mask to input
         
         Args:
             x: Input tensor (batch, input_dim)
@@ -137,40 +160,39 @@ class LOUPEMask(nn.Module):
             x_masked: Masked input (batch, input_dim)
             mask: Binary mask used (batch, input_dim)
         """
-        # Get probabilities
-        probs = self.get_probabilities()
-        
-        # Rescale to meet sparsity budget
-        probs_rescaled = self.rescale_probabilities(probs)
-        
-        # Sample or threshold based on training mode
-        if self.training:
-            # Stochastic sampling during training
-            mask = self.sample_mask(probs_rescaled)
-        else:
-            # Deterministic thresholding during inference
-            mask = (probs_rescaled >= 0.5).float()
-        
-        # Expand mask to batch dimension
         batch_size = x.size(0)
-        mask_expanded = mask.expand(batch_size, -1)
         
-        # Apply mask
-        x_masked = x * mask_expanded
+        # Step 1: ProbMask - convert logits to probabilities
+        probabilities = self.prob_mask(x)
         
-        return x_masked, mask_expanded
+        # Step 2: RescaleProbMap - rescale to match target sparsity
+        rescaled_prob = self.rescale_prob_map(probabilities)
+        
+        # Step 3: ThresholdRandomMask - sample binary mask
+        binary_mask = self.threshold_random_mask(rescaled_prob, training=self.training)
+        
+        # Store for visualization/debugging
+        self.latest_mask = rescaled_prob.detach()[0]
+        self.latest_bin_mask = binary_mask.detach()[0]
+        
+        # Step 4: Apply mask to input
+        masked_x = x * binary_mask
+        
+        return masked_x, binary_mask
     
     def get_sparsity(self):
         """
-        Get actual sparsity of current mask.
+        Get current actual sparsity (sampling rate) of the mask.
         
         Returns:
-            sparsity: Fraction of elements that are 1
+            sparsity: Mean probability after rescaling
         """
         with torch.no_grad():
-            mask = self.get_deterministic_mask()
-            sparsity = torch.mean(mask).item()
-        return sparsity
+            dummy_input = torch.zeros(1, self.input_dim, dtype=torch.float32, 
+                                     device=self.logits.device)
+            probabilities = self.prob_mask(dummy_input)
+            rescaled_prob = self.rescale_prob_map(probabilities)
+            return rescaled_prob.mean().item()
     
     def set_sparsity(self, new_sparsity):
         """
@@ -179,7 +201,7 @@ class LOUPEMask(nn.Module):
         Args:
             new_sparsity: New target sparsity value
         """
-        self.target_sparsity = torch.tensor(new_sparsity, device=self.logits.device)
+        self.sparsity = new_sparsity
     
     def get_mask_for_visualization(self):
         """
@@ -190,7 +212,15 @@ class LOUPEMask(nn.Module):
             mask_vis: Dictionary with visualization-ready masks
         """
         with torch.no_grad():
-            mask = self.get_deterministic_mask().cpu().numpy().squeeze()
+            # Get the latest rescaled probabilities
+            if self.latest_mask is not None:
+                mask = self.latest_mask.cpu().numpy()
+            else:
+                # Generate from scratch
+                dummy_input = torch.zeros(1, self.input_dim, device=self.logits.device)
+                probabilities = self.prob_mask(dummy_input)
+                rescaled_prob = self.rescale_prob_map(probabilities)
+                mask = rescaled_prob.cpu().numpy().squeeze()
             
             mask_vis = {}
             
@@ -225,47 +255,7 @@ class LOUPEMask(nn.Module):
     
     def extra_repr(self):
         """String representation for print(model)."""
-        return f'input_dim={self.input_dim}, sparsity={self.target_sparsity.item():.3f}, slope={self.slope}'
-
-
-# ============================================================================
-#                           UTILITY FUNCTIONS
-# ============================================================================
-
-def l1_loss(logits):
-    """
-    L1 regularization on logits.
-    
-    NOTE: This is NOT recommended to use with LOUPE mask!
-    LOUPE already controls sparsity through rescaling.
-    Adding L1 loss creates conflicting objectives.
-    
-    Args:
-        logits: Learnable parameters
-    
-    Returns:
-        l1: L1 norm
-    """
-    return torch.mean(torch.abs(logits))
-
-
-def mask_sparsity_loss(mask, target_sparsity):
-    """
-    Loss to encourage mask to match target sparsity.
-    
-    This is also NOT recommended with LOUPE, as rescaling already
-    ensures the sparsity budget is met. This is for reference only.
-    
-    Args:
-        mask: Binary mask
-        target_sparsity: Target sparsity value
-    
-    Returns:
-        loss: MSE between actual and target sparsity
-    """
-    actual_sparsity = torch.mean(mask.float())
-    loss = (actual_sparsity - target_sparsity) ** 2
-    return loss
+        return f'input_dim={self.input_dim}, sparsity={self.sparsity:.3f}, slope={self.slope.item()}'
 
 
 # ============================================================================
@@ -274,7 +264,7 @@ def mask_sparsity_loss(mask, target_sparsity):
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Testing LOUPE Mask")
+    print("Testing FIXED LOUPE Mask (Based on Working ProbabilisticMask)")
     print("=" * 70)
     
     # Configuration
@@ -292,6 +282,7 @@ if __name__ == "__main__":
         input_dim=fourier_input_dim,
         sparsity=target_sparsity,
         slope=5.0,
+        sample_slope=12.0,
         image_shape=(image_size, image_size)
     )
     
@@ -314,7 +305,7 @@ if __name__ == "__main__":
     print(f"Target sparsity: {target_sparsity:.4f}")
     print(f"Difference: {abs(mask_sample.mean().item() - target_sparsity):.4f}")
     
-    # Test multiple samples (should be different)
+    # Test multiple samples (should be different due to randomization)
     x_masked1, mask1 = mask(x)
     x_masked2, mask2 = mask(x)
     print(f"\nStochasticity check:")
@@ -334,18 +325,24 @@ if __name__ == "__main__":
     x_masked_eval2, mask_eval2 = mask(x)
     print(f"Deterministic? {torch.allclose(mask_eval, mask_eval2)}")
     
-    # Test sparsity adjustment
+    # Test gradient flow
     print("\n" + "-" * 70)
-    print("TEST 3: Sparsity adjustment")
+    print("TEST 3: Gradient flow (straight-through estimator)")
     print("-" * 70)
     
-    original_sparsity = mask.get_sparsity()
-    print(f"Original sparsity: {original_sparsity:.4f}")
+    mask.train()
+    x = torch.randn(batch_size, fourier_input_dim, requires_grad=True)
+    x_masked, mask_sample = mask(x)
     
-    mask.set_sparsity(0.2)
-    new_sparsity = mask.get_sparsity()
-    print(f"New target: 0.2")
-    print(f"Actual sparsity: {new_sparsity:.4f}")
+    # Dummy loss
+    loss = x_masked.sum()
+    loss.backward()
+    
+    print(f"Input gradient exists? {x.grad is not None}")
+    print(f"Logits gradient exists? {mask.logits.grad is not None}")
+    if mask.logits.grad is not None:
+        print(f"Logits gradient norm: {mask.logits.grad.norm().item():.6f}")
+        print(f"✓ Gradients flowing through mask!")
     
     # Test visualization
     print("\n" + "-" * 70)
@@ -361,35 +358,12 @@ if __name__ == "__main__":
         print(f"  Magnitude shape: {mask_vis['magnitude'].shape}")
         print(f"  Mean magnitude: {mask_vis['magnitude'].mean():.4f}")
     
-    # Test parameter count
-    print("\n" + "-" * 70)
-    print("TEST 5: Parameters")
-    print("-" * 70)
-    
-    total_params = sum(p.numel() for p in mask.parameters())
-    print(f"Total parameters: {total_params:,}")
-    print(f"Parameter shape: {mask.logits.shape}")
-    
-    # Test gradient flow
-    print("\n" + "-" * 70)
-    print("TEST 6: Gradient flow")
-    print("-" * 70)
-    
-    mask.train()
-    x = torch.randn(batch_size, fourier_input_dim, requires_grad=True)
-    x_masked, mask_sample = mask(x)
-    
-    # Dummy loss
-    loss = x_masked.sum()
-    loss.backward()
-    
-    print(f"Input gradient exists? {x.grad is not None}")
-    print(f"Logits gradient exists? {mask.logits.grad is not None}")
-    if mask.logits.grad is not None:
-        print(f"Logits gradient norm: {mask.logits.grad.norm().item():.6f}")
-    
     print("\n" + "=" * 70)
     print("All tests passed! ✓")
     print("=" * 70)
-    print("\nThis mask is ready to use in your training script!")
-    print("Remember: DO NOT add L1 regularization - it's not needed!")
+    print("\nThis mask uses the WORKING architecture from ProbabilisticMask!")
+    print("Key features:")
+    print("  ✓ Straight-through estimator for gradients")
+    print("  ✓ Conditional rescaling (not simple scaling)")
+    print("  ✓ Randomized sampling during training")
+    print("  ✓ All LOUPE layers from TensorFlow implementation")

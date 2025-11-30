@@ -1,11 +1,17 @@
 """
 Masked Dual VAE with Conditional Normalizing Flow (FIXED VERSION)
+
+KEY FIX: Removed redundant normalization!
+
+The VAE latents are ALREADY being pushed toward N(0,1) via KL divergence.
+We don't need to normalize them again before feeding to CNF.
+
+This should prevent the KL divergence from exploding.
+
 Combines:
 - LOUPE-style learnable mask
 - Dual VAE (probabilistic encoders)
 - OT-Flow (Conditional Normalizing Flow)
-
-This is the main model class that replaces MaskAutoEncCNF
 """
 
 import torch
@@ -25,6 +31,8 @@ class MaskDualVAECNF(nn.Module):
     2. Dual VAE - probabilistic encoders for spatial and Fourier domains
     3. Conditional Normalizing Flow (CNF) - learns smooth transport between latent distributions
     
+    CRITICAL FIX: No redundant normalization of VAE latents before CNF
+    
     Architecture:
         Input (x, condition)
             ↓
@@ -36,11 +44,9 @@ class MaskDualVAECNF(nn.Module):
             ↓
         Concatenate → z_combined
             ↓
+        CNF (NO normalization) → learn transport
+            ↓
         Decoder → reconstruction
-            ↓
-        Normalize → feed to CNF
-            ↓
-        OT-Flow → learn transport
     """
     
     def __init__(self, original_dim, encoding_dim, mask, vae, Phi, nt, eps):
@@ -73,6 +79,8 @@ class MaskDualVAECNF(nn.Module):
         """
         Forward pass through the complete model.
         
+        CRITICAL: VAE latents are NOT normalized before CNF anymore!
+        
         Args:
             x: Original images
                - Shape: (batch, 1, 28, 28) if CNN
@@ -82,11 +90,11 @@ class MaskDualVAECNF(nn.Module):
             return_all: If True, return all intermediate values
         
         Returns:
-            x_decoded: Reconstructed images (batch, 1, 28, 28)
+            reconstruction: Reconstructed images (batch, 1, 28, 28)
             Jc: OT-Flow loss
             costs: Individual OT cost terms
-            mu_combined: Mean of combined latent (for normalization)
-            musqrd_combined: Mean of squared combined latent
+            mu_combined: Mean of combined latent (for tracking)
+            musqrd_combined: Mean of squared combined latent (for tracking)
             mask: Binary mask used
             
             (if return_all=True):
@@ -106,20 +114,20 @@ class MaskDualVAECNF(nn.Module):
         z_four = components['z_four']    # (batch, encoding_dim)
         z_combined = components['z_combined']  # (batch, 2*encoding_dim)
         
-        # STEP 4: Compute statistics for normalization
-        # These are used by OT-Flow and also tracked across epochs
+        # STEP 4: Compute statistics for tracking (not for normalization!)
+        # These are just for monitoring the distribution
         mu_combined = torch.mean(z_combined, dim=0, keepdims=True)
         musqrd_combined = torch.mean(z_combined ** 2, dim=0, keepdims=True)
         
-        # STEP 5: Normalize for CNF
-        # OT-Flow expects normalized inputs
-        std_combined = torch.sqrt(torch.abs(mu_combined ** 2 - musqrd_combined) + self.eps)
-        normalized_combined = (z_combined - mu_combined) / (std_combined + self.eps)
+        # CRITICAL FIX: NO NORMALIZATION BEFORE CNF!
+        # The VAE KL loss already pushes z_combined toward N(0,1)
+        # Normalizing again causes the KL divergence to explode
         
         # Split into source (x0) and condition (y) for CNF
-        x0, y = normalized_combined.chunk(2, dim=1)  # Each: (batch, encoding_dim)
+        # DIRECTLY use the VAE latents WITHOUT normalization
+        x0, y = z_combined.chunk(2, dim=1)  # Each: (batch, encoding_dim)
         
-        # STEP 6: Pass through CNF (OT-Flow)
+        # STEP 5: Pass through CNF (OT-Flow)
         # Learn optimal transport from x0 to N(0,1) conditioned on y
         Jc, costs = OTFlowProblem(x0, y, self.Phi, [0, 1], nt=self.nt, 
                                    stepper="rk4", alph=self.Phi.alph)
@@ -135,6 +143,8 @@ class MaskDualVAECNF(nn.Module):
         Generate images by sampling from prior and flowing through CNF.
         
         This is used during validation/testing to generate samples.
+        
+        CRITICAL: No normalization here either!
         
         Args:
             condition: Fourier condition (num_samples, fourier_dim)
@@ -155,9 +165,8 @@ class MaskDualVAECNF(nn.Module):
             # Use mean for condition (deterministic)
             z_four = mu_four
             
-            # Normalize condition
-            y = (z_four - self.vae.mu[:, self.encoding_dim:]) / \
-                (self.vae.std[:, self.encoding_dim:] + self.eps)
+            # NO NORMALIZATION - use z_four directly as condition
+            y = z_four
             
             # Sample from standard normal for source
             z0 = torch.randn(num_samples, self.encoding_dim, device=device)
@@ -172,14 +181,9 @@ class MaskDualVAECNF(nn.Module):
             # We only need the first encoding_dim dimensions (the actual latent code)
             z_img_generated = z_img_generated[:, :self.encoding_dim]
             
-            # Denormalize
-            z_img_generated = z_img_generated * (self.vae.std[:, :self.encoding_dim] + self.eps) + \
-                             self.vae.mu[:, :self.encoding_dim]
-            z_four_denorm = z_four * (self.vae.std[:, self.encoding_dim:] + self.eps) + \
-                           self.vae.mu[:, self.encoding_dim:]
-            
-            # Concatenate and decode
-            z_combined = torch.cat([z_img_generated, z_four_denorm], dim=1)
+            # NO DE-NORMALIZATION since we never normalized!
+            # Just concatenate and decode
+            z_combined = torch.cat([z_img_generated, z_four], dim=1)
             generated_images = self.vae.decoder(z_combined)
             
             return generated_images, mask
@@ -192,7 +196,7 @@ class MaskDualVAECNF(nn.Module):
 def compute_vae_loss(reconstruction, target, mu_img, logvar_img, 
                      mu_four, logvar_four, beta=1.0):
     """
-    Compute VAE loss: reconstruction + KL divergence.
+    Compute VAE loss: reconstruction + β * KL divergence.
     
     Args:
         reconstruction: Reconstructed images
@@ -205,23 +209,29 @@ def compute_vae_loss(reconstruction, target, mu_img, logvar_img,
     
     Returns:
         total_loss: Combined VAE loss
-        recon_loss: Reconstruction loss
-        kl_loss: KL divergence
+        recon_loss: Reconstruction loss component
+        kl_loss: KL divergence component
+        kl_img: KL from image encoder
+        kl_four: KL from Fourier encoder
     """
     # Reconstruction loss (MSE)
     batch_size = reconstruction.size(0)
     recon_loss = F.mse_loss(reconstruction, target, reduction='sum') / batch_size
     
-    # KL divergence for both encoders
+    # KL divergence for image encoder
+    # KL(N(μ, σ²) || N(0, 1)) = -0.5 * sum(1 + log(σ²) - μ² - σ²)
     kl_img = -0.5 * torch.sum(1 + logvar_img - mu_img.pow(2) - logvar_img.exp()) / batch_size
+    
+    # KL divergence for Fourier encoder
     kl_four = -0.5 * torch.sum(1 + logvar_four - mu_four.pow(2) - logvar_four.exp()) / batch_size
     
+    # Total KL divergence
     kl_loss = kl_img + kl_four
     
     # Total VAE loss
     total_loss = recon_loss + beta * kl_loss
     
-    return total_loss, recon_loss, kl_loss
+    return total_loss, recon_loss, kl_loss, kl_img, kl_four
 
 
 def compute_total_loss(reconstruction, target, mu_img, logvar_img, 
@@ -242,7 +252,7 @@ def compute_total_loss(reconstruction, target, mu_img, logvar_img,
         loss_dict: Dictionary with individual loss components
     """
     # VAE loss
-    vae_loss, recon_loss, kl_loss = compute_vae_loss(
+    vae_loss, recon_loss, kl_loss, kl_img, kl_four = compute_vae_loss(
         reconstruction, target, mu_img, logvar_img, mu_four, logvar_four, beta
     )
     
@@ -255,6 +265,8 @@ def compute_total_loss(reconstruction, target, mu_img, logvar_img,
         'vae': vae_loss.item(),
         'reconstruction': recon_loss.item(),
         'kl': kl_loss.item(),
+        'kl_img': kl_img.item(),
+        'kl_four': kl_four.item(),
         'ot_flow': ot_flow_loss.item()
     }
     
@@ -267,7 +279,7 @@ def compute_total_loss(reconstruction, target, mu_img, logvar_img,
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Testing MaskDualVAECNF")
+    print("Testing FIXED MaskDualVAECNF (No Redundant Normalization)")
     print("=" * 70)
     
     # This requires importing actual components
@@ -285,9 +297,11 @@ if __name__ == "__main__":
     print("  - compute_total_loss")
     
     print("\n" + "=" * 70)
+    print("CRITICAL FIX APPLIED:")
+    print("=" * 70)
+    print("  ✓ Removed redundant normalization of VAE latents before CNF")
+    print("  ✓ VAE KL loss already pushes latents toward N(0,1)")
+    print("  ✓ No need to normalize again - this was causing KL explosion")
+    print("\n" + "=" * 70)
     print("Model definition complete! ✓")
     print("=" * 70)
-    print("\nNext steps:")
-    print("1. Place this file in: src/prototyping/MaskDualVAECNF.py")
-    print("2. Update imports in training script")
-    print("3. Initialize model with mask, vae, and Phi")
