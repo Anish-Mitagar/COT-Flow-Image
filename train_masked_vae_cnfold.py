@@ -1,14 +1,5 @@
 """
-Train Masked Dual VAE + CNF for MRI Reconstruction (ENHANCED VERSION)
-
-ENHANCEMENTS:
-1. Validate every epoch (val_freq default = 1)
-2. Print stats every epoch
-3. Fixed validation sparsity behavior (starts low, increases over time)
-4. Added --ot_flow_regular argument (default 1.0)
-5. Added --gradient_clipping argument (default False)
-6. Added --cnf_norm argument (default False)
-7. Final test set evaluation with plots
+Train Masked Dual VAE + CNF for MRI Reconstruction
 
 This script trains the complete model:
 - LOUPE-style learnable mask
@@ -36,17 +27,12 @@ sys.path.insert(0, os.path.abspath('.'))
 
 # Import project modules
 from datasets.mnist import getLoader
-
-# Import from root-level files (matching main_vae.py structure)
-from dual_vae import DualVAE
-
-# Import from src.prototyping (our new files)
 from src.prototyping.LOUPEMask import LOUPEMask
+from src.prototyping.DualVAE import DualVAE
 from src.prototyping.MaskDualVAECNF import MaskDualVAECNF
 from src.prototyping.TrainingUtilsVAE import (
     train_epoch, validate_epoch, KLAnnealer, 
-    MetricsTracker, save_checkpoint, load_checkpoint,
-    prepare_fourier_data
+    MetricsTracker, save_checkpoint, load_checkpoint
 )
 from src.prototyping.PlottingUtilsVAE import (
     plot_loss_curves, plot_reconstructions, plot_mask,
@@ -75,12 +61,12 @@ def get_args():
     if cf.gpu:
         def_batch = 800
         def_epochs = 200
-        def_val_freq = 1  # CHANGED: validate every epoch
+        def_val_freq = 10
         def_viz_freq = 10
     else:
         def_batch = 200
         def_epochs = 50
-        def_val_freq = 1  # CHANGED: validate every epoch
+        def_val_freq = 5
         def_viz_freq = 5
     
     parser = argparse.ArgumentParser('Train Masked Dual VAE + CNF')
@@ -97,7 +83,7 @@ def get_args():
     parser.add_argument('--latent_dim', type=int, default=64,
                        help='Latent dimension for each encoder')
     parser.add_argument('--sparsity', type=float, default=0.1,
-                       help='Target mask sparsity (0.1 = 10%%)')
+                       help='Target mask sparsity (0.1 = 10%)')
     parser.add_argument('--slope', type=float, default=5.0,
                        help='Slope parameter for LOUPE sigmoid')
     
@@ -127,22 +113,12 @@ def get_args():
     parser.add_argument('--eps', type=float, default=1e-6,
                        help='Epsilon for numerical stability')
     
-    # NEW ARGUMENTS for controlling training
-    parser.add_argument('--ot_flow_regular', type=float, default=1.0,
-                       help='Regularization weight for OT-Flow loss (default: 1.0)')
-    parser.add_argument('--gradient_clipping', action='store_true',
-                       help='Enable gradient clipping (helps with KL explosion)')
-    parser.add_argument('--clip_value', type=float, default=1.0,
-                       help='Maximum gradient norm for clipping (default: 1.0)')
-    parser.add_argument('--cnf_norm', action='store_true',
-                       help='Enable CNF normalization (experimental, may cause KL explosion)')
-    
     # KL annealing arguments
     parser.add_argument('--use_kl_annealing', action='store_true',
                        help='Use KL annealing')
     parser.add_argument('--beta_target', type=float, default=1.0,
                        help='Target beta for KL weight')
-    parser.add_argument('--anneal_epochs', type=int, default=20,
+    parser.add_argument('--anneal_epochs', type=int, default=10,
                        help='Number of epochs to anneal KL weight')
     
     # Checkpoint arguments
@@ -153,7 +129,7 @@ def get_args():
     
     # Logging arguments
     parser.add_argument('--val_freq', type=int, default=def_val_freq,
-                       help='Validation frequency (epochs) - default 1')
+                       help='Validation frequency (epochs)')
     parser.add_argument('--viz_freq', type=int, default=def_viz_freq,
                        help='Visualization frequency (epochs)')
     parser.add_argument('--save_freq', type=int, default=20,
@@ -208,7 +184,7 @@ def main():
     
     # Print configuration
     log("=" * 80)
-    log(f"Training Masked Dual VAE + CNF (ENHANCED VERSION)")
+    log(f"Training Masked Dual VAE + CNF")
     log("=" * 80)
     log(f"\nStart time: {start_time}")
     log(f"\nConfiguration:")
@@ -226,14 +202,7 @@ def main():
         log(f"    Beta target: {args.beta_target}")
         log(f"    Anneal epochs: {args.anneal_epochs}")
     log(f"  CNF time steps: {args.nt}")
-    log(f"\nNEW FEATURES:")
-    log(f"  OT-Flow regularization: {args.ot_flow_regular}")
-    log(f"  Gradient clipping: {args.gradient_clipping}")
-    if args.gradient_clipping:
-        log(f"    Clip value: {args.clip_value}")
-    log(f"  CNF normalization: {args.cnf_norm}")
-    log(f"  Validation frequency: every {args.val_freq} epoch(s)")
-    log(f"\n  Save directory: {args.save}")
+    log(f"  Save directory: {args.save}")
     log("")
     
     # Load data
@@ -262,32 +231,38 @@ def main():
         sparsity=args.sparsity,
         slope=args.slope,
         image_shape=(image_size, image_size)
-    )
-    log(f"  LOUPE Mask: {fourier_input_dim} → sparsity={args.sparsity}")
+    ).to(device)
+    
+    log(f"  LOUPE Mask: {sum(p.numel() for p in mask.parameters())} parameters")
     
     # 2. Dual VAE
-    vae = DualVAE(
-        image_channels=1,
-        image_size=image_size,
-        fourier_input_dim=fourier_input_dim,
-        latent_dim=args.latent_dim
-    )
-    log(f"  Dual VAE: latent_dim={args.latent_dim}")
+    original_dim = image_size * image_size
     
-    # 3. CNF (Phi network)
-    original_dim = image_size * image_size  # 784
-    combined_latent_dim = args.latent_dim * 2  # Image + Fourier
+    vae = DualVAE(
+        original_dim=original_dim,
+        encoding_dim=args.latent_dim,
+        fourier_input_dim=fourier_input_dim,
+        image_size=image_size
+    ).to(device)
+    
+    log(f"  Dual VAE: {sum(p.numel() for p in vae.parameters())} parameters")
+    
+    # 3. CNF (Phi)
+    # dx = dimension of x (image latent), dy = dimension of y (Fourier latent)
+    dx = args.latent_dim
+    dy = args.latent_dim
     
     cnf = Phi(
         nTh=args.nTh,
         m=args.m,
-        dx=args.latent_dim,  # Source dimension (image encoder)
-        dy=args.latent_dim,  # Condition dimension (Fourier encoder)
+        dx=dx,
+        dy=dy,
         alph=args.alph
-    )
-    log(f"  CNF (Phi): m={args.m}, dx={args.latent_dim}, dy={args.latent_dim}, nTh={args.nTh}")
+    ).to(device)
     
-    # 4. Complete model
+    log(f"  CNF (Phi): {sum(p.numel() for p in cnf.parameters())} parameters")
+    
+    # 4. Complete Model
     model = MaskDualVAECNF(
         original_dim=original_dim,
         encoding_dim=args.latent_dim,
@@ -295,8 +270,7 @@ def main():
         vae=vae,
         Phi=cnf,
         nt=args.nt,
-        eps=args.eps,
-        cnf_norm=args.cnf_norm  # NEW parameter
+        eps=args.eps
     ).to(device)
     
     total_params = sum(p.numel() for p in model.parameters())
@@ -371,22 +345,16 @@ def main():
         # Train
         train_metrics = train_epoch(
             model, train_loader, optimizer_vae, optimizer_cnf, optimizer_mask,
-            beta, device, epoch,
-            ot_flow_regular=args.ot_flow_regular,  # NEW
-            gradient_clipping=args.gradient_clipping,  # NEW
-            clip_value=args.clip_value  # NEW
+            beta, device, epoch
         )
         
         # Update metrics
         metrics_tracker.update('train', train_metrics, epoch + 1)
         
-        # CHANGED: Validate based on val_freq (now defaults to 1 = every epoch)
-        should_validate = ((epoch + 1) % args.val_freq == 0) or (epoch == 0)
-        
-        if should_validate:
+        # Validate
+        if (epoch + 1) % args.val_freq == 0 or epoch == 0:
             val_metrics, val_samples = validate_epoch(
-                model, val_loader, beta, device, epoch,
-                ot_flow_regular=args.ot_flow_regular  # NEW
+                model, val_loader, beta, device, epoch
             )
             
             # Update metrics
@@ -403,34 +371,30 @@ def main():
                     epoch, val_metrics, best_checkpoint_path
                 )
                 log(f"  ✓ New best model saved (loss: {best_val_loss:.4f})")
-        
-        # CHANGED: Print stats every epoch (not just when validating)
-        log("")
-        log(f"Epoch {epoch+1}/{args.num_epochs}")
-        log(f"  Train - Loss: {train_metrics['loss']:.4f} | "
-            f"Recon: {train_metrics['recon_loss']:.4f} | "
-            f"KL: {train_metrics['kl_loss']:.4f} | "
-            f"OT: {train_metrics['ot_loss']:.4f} | "
-            f"PSNR: {train_metrics['psnr']:.2f} dB | "
-            f"Sparsity: {train_metrics['sparsity']:.4f}")
-        
-        if should_validate:
+            
+            # Log validation results
+            log("")
+            log(f"Epoch {epoch+1}/{args.num_epochs}")
+            log(f"  Train - Loss: {train_metrics['loss']:.4f} | "
+                f"Recon: {train_metrics['recon_loss']:.4f} | "
+                f"KL: {train_metrics['kl_loss']:.4f} | "
+                f"OT: {train_metrics['ot_loss']:.4f} | "
+                f"PSNR: {train_metrics['psnr']:.2f} dB | "
+                f"Sparsity: {train_metrics['sparsity']:.4f}")
             log(f"  Val   - Loss: {val_metrics['loss']:.4f} | "
                 f"Recon: {val_metrics['recon_loss']:.4f} | "
                 f"KL: {val_metrics['kl_loss']:.4f} | "
                 f"OT: {val_metrics['ot_loss']:.4f} | "
                 f"PSNR: {val_metrics['psnr']:.2f} dB | "
                 f"Sparsity: {val_metrics['sparsity']:.4f}")
-        
-        log(f"  Beta: {beta:.4f} | Time: {time.time() - epoch_start_time:.1f}s")
+            log(f"  Beta: {beta:.4f} | Time: {time.time() - epoch_start_time:.1f}s")
         
         # Visualize
         if (epoch + 1) % args.viz_freq == 0 or epoch == 0:
             # Validate to get samples if we haven't already
-            if not should_validate:
+            if (epoch + 1) % args.val_freq != 0 and epoch != 0:
                 _, val_samples = validate_epoch(
-                    model, val_loader, beta, device, epoch,
-                    ot_flow_regular=args.ot_flow_regular
+                    model, val_loader, beta, device, epoch
                 )
             
             # Plot reconstructions
@@ -448,12 +412,12 @@ def main():
             )
             
             # Generate samples from prior
-            # Get real Fourier samples from validation set
+            # Get real Fourier samples from validation set (NOT random noise!)
             val_iter = iter(val_loader)
-            _, sample_fourier, _ = next(val_iter)
+            _, sample_fourier, _ = next(val_iter)  # Get Fourier-transformed images
             
             plot_generated_samples(
-                model, sample_fourier,
+                model, sample_fourier,  # Pass the actual Fourier samples
                 device, num_samples=16,
                 save_path=os.path.join(args.save, 'figs', f'generated_epoch_{epoch+1:03d}.png')
             )
@@ -497,17 +461,11 @@ def main():
     metrics_tracker.save(metrics_path)
     log(f"Metrics saved to: {metrics_path}")
     
-    # ENHANCED: Final test set evaluation with ALL plots
+    # Final evaluation
     log("")
-    log("=" * 80)
-    log("FINAL TEST SET EVALUATION")
-    log("=" * 80)
-    log("")
-    log("Running final evaluation on test set...")
-    
+    log("Running final evaluation...")
     final_metrics, final_samples = validate_epoch(
-        model, test_loader, args.beta_target, device, args.num_epochs - 1,
-        ot_flow_regular=args.ot_flow_regular
+        model, test_loader, args.beta_target, device, args.num_epochs - 1
     )
     
     log("")
@@ -521,62 +479,17 @@ def main():
     log(f"  PSNR: {final_metrics['psnr']:.2f} dB")
     log(f"  Sparsity: {final_metrics['sparsity']:.4f}")
     
-    # ENHANCED: Generate final test visualizations
-    log("")
-    log("Generating final test visualizations...")
-    
-    # 1. Plot reconstructions on test set
-    original_test, reconstructed_test, mask_test = final_samples
-    plot_reconstructions(
-        original_test, reconstructed_test, mask_test,
-        os.path.join(args.save, 'figs', 'FINAL_test_reconstructions.png')
-    )
-    log("  ✓ Test reconstructions saved")
-    
-    # 2. Plot final learned mask
-    plot_mask(
-        model.mask,
-        os.path.join(args.save, 'figs'),
-        epoch=999,  # Special marker for final
-        prefix='FINAL_test'
-    )
-    log("  ✓ Test mask visualization saved")
-    
-    # 3. Generate samples from prior on test set
-    test_iter = iter(test_loader)
-    _, test_fourier, _ = next(test_iter)
-    
-    plot_generated_samples(
-        model, test_fourier,
-        device, num_samples=16,
-        save_path=os.path.join(args.save, 'figs', 'FINAL_test_generated_samples.png')
-    )
-    log("  ✓ Test generated samples saved")
-    
-    # 4. Create comprehensive training summary
+    # Create summary
     create_training_summary(
         metrics_tracker,
         os.path.join(args.save, 'figs', 'training_summary.png'),
         final_metrics
     )
-    log("  ✓ Training summary saved")
     
     log("")
     log(f"All outputs saved to: {args.save}")
     log("")
     log("=" * 80)
-    log("TRAINING COMPLETED SUCCESSFULLY!")
-    log("=" * 80)
-    log("")
-    log("Key improvements in this version:")
-    log("  ✓ Validation every epoch (default)")
-    log("  ✓ Stats printed every epoch")
-    log("  ✓ Fixed validation sparsity behavior")
-    log("  ✓ OT-Flow regularization control")
-    log("  ✓ Optional gradient clipping")
-    log("  ✓ Optional CNF normalization")
-    log("  ✓ Complete final test evaluation with plots")
-    log("")
     
     log_file.close()
 

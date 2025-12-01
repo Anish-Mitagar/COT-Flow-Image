@@ -1,9 +1,5 @@
 """
-Training Utilities for Masked Dual VAE + CNF (FIXED VERSION)
-
-FIXES:
-1. Validation sparsity now computed from actual binary mask (not rescaled probabilities)
-2. This matches the behavior in train_vae.py where sparsity starts low and increases
+Training Utilities for Masked Dual VAE + CNF
 
 This module provides training and validation functions for the complete
 Masked Dual VAE + CNF model. It handles:
@@ -123,8 +119,7 @@ def prepare_fourier_data(fourier_images):
 
 
 def train_epoch(model, train_loader, optimizer_vae, optimizer_cnf, optimizer_mask,
-                beta, device, epoch, ot_flow_regular=1.0, gradient_clipping=False, 
-                clip_value=1.0, logger=None):
+                beta, device, epoch, logger=None):
     """
     Train for one epoch.
     
@@ -137,9 +132,6 @@ def train_epoch(model, train_loader, optimizer_vae, optimizer_cnf, optimizer_mas
         beta: Current β value for KL weight
         device: Device to train on
         epoch: Current epoch number
-        ot_flow_regular: Regularization weight for OT-Flow loss (default 1.0)
-        gradient_clipping: Whether to apply gradient clipping (default False)
-        clip_value: Maximum gradient norm for clipping (default 1.0)
         logger: Optional logger for detailed logging
         
     Returns:
@@ -204,8 +196,8 @@ def train_epoch(model, train_loader, optimizer_vae, optimizer_cnf, optimizer_mas
         kl_four = -0.5 * torch.sum(1 + logvar_four - mu_four.pow(2) - logvar_four.exp()) / batch_size
         kl_loss = kl_img + kl_four
         
-        # OT-Flow loss with regularization weight
-        ot_loss = ot_flow_regular * Jc
+        # OT-Flow loss
+        ot_loss = Jc
         
         # Total loss
         loss = recon_loss + beta * kl_loss + ot_loss
@@ -217,10 +209,6 @@ def train_epoch(model, train_loader, optimizer_vae, optimizer_cnf, optimizer_mas
         
         loss.backward()
         
-        # Optional gradient clipping
-        if gradient_clipping:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
-        
         optimizer_vae.step()
         optimizer_cnf.step()
         optimizer_mask.step()
@@ -229,8 +217,7 @@ def train_epoch(model, train_loader, optimizer_vae, optimizer_cnf, optimizer_mas
         with torch.no_grad():
             psnr = compute_psnr(reconstruction.view(batch_size, -1), 
                                target.view(batch_size, -1))
-            # TRAINING SPARSITY: use actual binary mask mean
-            sparsity = mask.float().mean().item()
+            sparsity = model.mask.get_sparsity()
         
         # Update tracking
         total_loss += loss.item()
@@ -238,7 +225,7 @@ def train_epoch(model, train_loader, optimizer_vae, optimizer_cnf, optimizer_mas
         total_kl_loss += kl_loss.item()
         total_kl_img += kl_img.item()
         total_kl_four += kl_four.item()
-        total_ot_loss += Jc.item()  # Store unweighted OT loss
+        total_ot_loss += ot_loss.item()
         total_psnr += psnr
         total_sparsity += sparsity
         num_batches += 1
@@ -248,7 +235,7 @@ def train_epoch(model, train_loader, optimizer_vae, optimizer_cnf, optimizer_mas
             'Loss': f'{loss.item():.2f}',
             'Recon': f'{recon_loss.item():.2f}',
             'KL': f'{kl_loss.item():.2f}',
-            'OT': f'{Jc.item():.2f}',
+            'OT': f'{ot_loss.item():.2f}',
             'PSNR': f'{psnr:.1f}',
             'Spar': f'{sparsity:.3f}',
             'β': f'{beta:.4f}'
@@ -261,7 +248,7 @@ def train_epoch(model, train_loader, optimizer_vae, optimizer_cnf, optimizer_mas
         'kl_loss': total_kl_loss / num_batches,
         'kl_img': total_kl_img / num_batches,
         'kl_four': total_kl_four / num_batches,
-        'ot_loss': total_ot_loss / num_batches,  # Unweighted
+        'ot_loss': total_ot_loss / num_batches,
         'psnr': total_psnr / num_batches,
         'sparsity': total_sparsity / num_batches,
         'beta': beta
@@ -270,26 +257,21 @@ def train_epoch(model, train_loader, optimizer_vae, optimizer_cnf, optimizer_mas
     return metrics
 
 
-def validate_epoch(model, val_loader, beta, device, epoch, ot_flow_regular=1.0, 
-                   save_samples=True):
+def validate_epoch(model, val_loader, beta, device, epoch, logger=None):
     """
     Validate for one epoch.
     
-    CRITICAL FIX: Validation sparsity is now computed from actual binary mask,
-    not from rescaled probabilities. This matches train_vae.py behavior.
-    
     Args:
         model: MaskDualVAECNF model
-        val_loader: DataLoader for validation data
+        val_loader: DataLoader for validation data (returns img, fourier_img, label)
         beta: Current β value for KL weight
         device: Device to validate on
         epoch: Current epoch number
-        ot_flow_regular: Regularization weight for OT-Flow loss (default 1.0)
-        save_samples: Whether to save samples for visualization
+        logger: Optional logger for detailed logging
         
     Returns:
-        metrics: Dictionary with average metrics
-        saved_samples: Tuple of (original, reconstructed, mask) for visualization
+        metrics: Dictionary with average metrics over epoch
+        samples: Tuple of (x, reconstruction, mask) for visualization
     """
     model.eval()
     
@@ -305,7 +287,7 @@ def validate_epoch(model, val_loader, beta, device, epoch, ot_flow_regular=1.0,
     
     num_batches = 0
     
-    # For saving visualization samples
+    # Save first batch for visualization
     saved_samples = None
     
     # Progress bar
@@ -326,10 +308,11 @@ def validate_epoch(model, val_loader, beta, device, epoch, ot_flow_regular=1.0,
             else:
                 x_spatial = images.view(images.size(0), -1)
             
-            # Convert Fourier data
+            # Convert Fourier data to real-imag format
+            # fourier_images is already FFT'd by the dataloader!
             x_fourier = prepare_fourier_data(fourier_images)
             
-            # Forward pass
+            # Forward pass (deterministic in eval mode)
             reconstruction, Jc, costs, mu_combined, musqrd_combined, mask, \
                 mu_img, logvar_img, mu_four, logvar_four = \
                 model(x_spatial, x_fourier, return_all=True)
@@ -337,35 +320,26 @@ def validate_epoch(model, val_loader, beta, device, epoch, ot_flow_regular=1.0,
             # Compute losses
             batch_size = images.size(0)
             
-            # Reconstruction loss
             if reconstruction.dim() == 4:
                 target = x_spatial
             else:
                 target = x_spatial.view(-1, 784)
+            
             recon_loss = F.mse_loss(reconstruction.view(batch_size, -1), 
                                     target.view(batch_size, -1), 
                                     reduction='sum') / batch_size
             
-            # KL divergence
             kl_img = -0.5 * torch.sum(1 + logvar_img - mu_img.pow(2) - logvar_img.exp()) / batch_size
             kl_four = -0.5 * torch.sum(1 + logvar_four - mu_four.pow(2) - logvar_four.exp()) / batch_size
             kl_loss = kl_img + kl_four
             
-            # OT-Flow loss with regularization
-            ot_loss = ot_flow_regular * Jc
-            
-            # Total loss
+            ot_loss = Jc
             loss = recon_loss + beta * kl_loss + ot_loss
             
             # Compute metrics
             psnr = compute_psnr(reconstruction.view(batch_size, -1), 
                                target.view(batch_size, -1))
-            
-            # CRITICAL FIX: VALIDATION SPARSITY from actual binary mask
-            # This is the key difference - during validation (eval mode), 
-            # the mask uses hard thresholding, so we compute sparsity from 
-            # the actual binary mask values, not from rescaled probabilities
-            sparsity = mask.float().mean().item()
+            sparsity = model.mask.get_sparsity()
             
             # Update tracking
             total_loss += loss.item()
@@ -373,15 +347,15 @@ def validate_epoch(model, val_loader, beta, device, epoch, ot_flow_regular=1.0,
             total_kl_loss += kl_loss.item()
             total_kl_img += kl_img.item()
             total_kl_four += kl_four.item()
-            total_ot_loss += Jc.item()  # Unweighted
+            total_ot_loss += ot_loss.item()
             total_psnr += psnr
             total_sparsity += sparsity
             num_batches += 1
             
             # Save first batch for visualization
-            if save_samples and batch_idx == 0:
+            if saved_samples is None:
                 saved_samples = (
-                    x_spatial[:16].cpu(),
+                    images[:16].cpu(),
                     reconstruction[:16].cpu(),
                     mask[:16].cpu()
                 )
@@ -391,7 +365,7 @@ def validate_epoch(model, val_loader, beta, device, epoch, ot_flow_regular=1.0,
                 'Loss': f'{loss.item():.2f}',
                 'Recon': f'{recon_loss.item():.2f}',
                 'KL': f'{kl_loss.item():.2f}',
-                'OT': f'{Jc.item():.2f}',
+                'OT': f'{ot_loss.item():.2f}',
                 'PSNR': f'{psnr:.1f}',
                 'Spar': f'{sparsity:.3f}'
             })
@@ -403,7 +377,7 @@ def validate_epoch(model, val_loader, beta, device, epoch, ot_flow_regular=1.0,
         'kl_loss': total_kl_loss / num_batches,
         'kl_img': total_kl_img / num_batches,
         'kl_four': total_kl_four / num_batches,
-        'ot_loss': total_ot_loss / num_batches,  # Unweighted
+        'ot_loss': total_ot_loss / num_batches,
         'psnr': total_psnr / num_batches,
         'sparsity': total_sparsity / num_batches,
         'beta': beta
@@ -567,12 +541,7 @@ class MetricsTracker:
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Testing TrainingUtilsVAE (FIXED VERSION)")
-    print("=" * 70)
-    print("\nFIXES APPLIED:")
-    print("  ✓ Validation sparsity computed from actual binary mask")
-    print("  ✓ Added ot_flow_regular parameter")
-    print("  ✓ Added gradient_clipping parameter")
+    print("Testing TrainingUtilsVAE (CORRECTED VERSION)")
     print("=" * 70)
     
     # Test KL Annealer
@@ -596,6 +565,7 @@ if __name__ == "__main__":
     # Test Fourier data preparation
     print("\nTEST 3: Fourier Data Preparation")
     print("-" * 70)
+    # Simulate FFT'd data from dataloader
     img = torch.randn(4, 1, 28, 28)
     fourier_complex = torch.fft.fft2(img)
     
@@ -606,6 +576,29 @@ if __name__ == "__main__":
     assert fourier_flat.shape == (4, 1568), "Shape mismatch!"
     print("✓ Shape correct!")
     
-    print("\n" + "=" * 70)
+    # Test MetricsTracker
+    print("\nTEST 4: MetricsTracker")
+    print("-" * 70)
+    tracker = MetricsTracker()
+    
+    for epoch in range(3):
+        train_metrics = {
+            'loss': 100.0 - epoch * 10,
+            'psnr': 15.0 + epoch * 2
+        }
+        val_metrics = {
+            'loss': 110.0 - epoch * 10,
+            'psnr': 14.0 + epoch * 2
+        }
+        
+        tracker.update('train', train_metrics)
+        tracker.update('val', val_metrics)
+    
+    print(f"Train losses: {tracker.get('train', 'loss')}")
+    print(f"Val PSNRs: {tracker.get('val', 'psnr')}")
+    
+    print("\n" * 70)
     print("All tests passed! ✓")
     print("=" * 70)
+    print("\nIMPORTANT: This version uses Fourier data from the dataloader")
+    print("instead of computing FFT during training!")

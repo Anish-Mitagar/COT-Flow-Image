@@ -1,13 +1,12 @@
 """
-Masked Dual VAE with Conditional Normalizing Flow (ENHANCED VERSION)
+Masked Dual VAE with Conditional Normalizing Flow (FIXED VERSION)
 
-ENHANCEMENTS:
-1. Optional CNF normalization (cnf_norm parameter)
-2. By default, NO normalization (prevents KL explosion)
-3. Can be enabled via cnf_norm=True for experimentation
+KEY FIX: Removed redundant normalization!
 
 The VAE latents are ALREADY being pushed toward N(0,1) via KL divergence.
-We typically don't need to normalize them again before feeding to CNF.
+We don't need to normalize them again before feeding to CNF.
+
+This should prevent the KL divergence from exploding.
 
 Combines:
 - LOUPE-style learnable mask
@@ -32,6 +31,8 @@ class MaskDualVAECNF(nn.Module):
     2. Dual VAE - probabilistic encoders for spatial and Fourier domains
     3. Conditional Normalizing Flow (CNF) - learns smooth transport between latent distributions
     
+    CRITICAL FIX: No redundant normalization of VAE latents before CNF
+    
     Architecture:
         Input (x, condition)
             ↓
@@ -43,13 +44,12 @@ class MaskDualVAECNF(nn.Module):
             ↓
         Concatenate → z_combined
             ↓
-        CNF (optional normalization) → learn transport
+        CNF (NO normalization) → learn transport
             ↓
         Decoder → reconstruction
     """
     
-    def __init__(self, original_dim, encoding_dim, mask, vae, Phi, nt, eps, 
-                 cnf_norm=False):
+    def __init__(self, original_dim, encoding_dim, mask, vae, Phi, nt, eps):
         """
         Args:
             original_dim: Dimension of original images (e.g., 784)
@@ -59,9 +59,6 @@ class MaskDualVAECNF(nn.Module):
             Phi: OT-Flow network (conditional normalizing flow)
             nt: Number of time steps for OT integration
             eps: Small epsilon for numerical stability
-            cnf_norm: Whether to normalize VAE latents before CNF (default: False)
-                     - False: NO normalization (recommended, prevents KL explosion)
-                     - True: Normalize using batch statistics (experimental)
         """
         super(MaskDualVAECNF, self).__init__()
         
@@ -72,7 +69,6 @@ class MaskDualVAECNF(nn.Module):
         self.Phi = Phi
         self.nt = nt
         self.eps = eps
-        self.cnf_norm = cnf_norm
         
         # Track encoder types for data preprocessing
         # This is for backward compatibility with existing data loaders
@@ -82,6 +78,8 @@ class MaskDualVAECNF(nn.Module):
     def forward(self, x, condition, return_all=False):
         """
         Forward pass through the complete model.
+        
+        CRITICAL: VAE latents are NOT normalized before CNF anymore!
         
         Args:
             x: Original images
@@ -112,47 +110,26 @@ class MaskDualVAECNF(nn.Module):
             self.vae(x, masked_condition, return_components=True)
         
         # Get the sampled latent codes
-        z_img = components['z_image']      # (batch, encoding_dim)
-        z_four = components['z_fourier']    # (batch, encoding_dim)
+        z_img = components['z_img']      # (batch, encoding_dim)
+        z_four = components['z_four']    # (batch, encoding_dim)
         z_combined = components['z_combined']  # (batch, 2*encoding_dim)
         
-        # STEP 4: Compute statistics for tracking
+        # STEP 4: Compute statistics for tracking (not for normalization!)
+        # These are just for monitoring the distribution
         mu_combined = torch.mean(z_combined, dim=0, keepdims=True)
         musqrd_combined = torch.mean(z_combined ** 2, dim=0, keepdims=True)
         
-        # STEP 5: Prepare input for CNF
+        # CRITICAL FIX: NO NORMALIZATION BEFORE CNF!
+        # The VAE KL loss already pushes z_combined toward N(0,1)
+        # Normalizing again causes the KL divergence to explode
+        
         # Split into source (x0) and condition (y) for CNF
+        # DIRECTLY use the VAE latents WITHOUT normalization
         x0, y = z_combined.chunk(2, dim=1)  # Each: (batch, encoding_dim)
         
-        # OPTIONAL: Normalize before CNF (controlled by cnf_norm flag)
-        if self.cnf_norm:
-            # Normalize using batch statistics
-            x0_mean = x0.mean(dim=0, keepdim=True)
-            x0_std = x0.std(dim=0, keepdim=True) + self.eps
-            x0_norm = (x0 - x0_mean) / x0_std
-            
-            y_mean = y.mean(dim=0, keepdim=True)
-            y_std = y.std(dim=0, keepdim=True) + self.eps
-            y_norm = (y - y_mean) / y_std
-            
-            # Use normalized inputs for CNF
-            x0_cnf = x0_norm
-            y_cnf = y_norm
-            
-            # Store normalization params for generation
-            self._x0_mean = x0_mean
-            self._x0_std = x0_std
-            self._y_mean = y_mean
-            self._y_std = y_std
-        else:
-            # NO normalization - use VAE latents directly
-            # The VAE KL loss already pushes them toward N(0,1)
-            x0_cnf = x0
-            y_cnf = y
-        
-        # STEP 6: Pass through CNF (OT-Flow)
+        # STEP 5: Pass through CNF (OT-Flow)
         # Learn optimal transport from x0 to N(0,1) conditioned on y
-        Jc, costs = OTFlowProblem(x0_cnf, y_cnf, self.Phi, [0, 1], nt=self.nt, 
+        Jc, costs = OTFlowProblem(x0, y, self.Phi, [0, 1], nt=self.nt, 
                                    stepper="rk4", alph=self.Phi.alph)
         
         if return_all:
@@ -166,6 +143,8 @@ class MaskDualVAECNF(nn.Module):
         Generate images by sampling from prior and flowing through CNF.
         
         This is used during validation/testing to generate samples.
+        
+        CRITICAL: No normalization here either!
         
         Args:
             condition: Fourier condition (num_samples, fourier_dim)
@@ -186,17 +165,8 @@ class MaskDualVAECNF(nn.Module):
             # Use mean for condition (deterministic)
             z_four = mu_four
             
-            # Prepare condition for CNF
-            if self.cnf_norm:
-                # Use stored normalization params from last forward pass
-                if hasattr(self, '_y_mean') and hasattr(self, '_y_std'):
-                    y = (z_four - self._y_mean) / (self._y_std + self.eps)
-                else:
-                    # Fall back to no normalization if params not available
-                    y = z_four
-            else:
-                # No normalization
-                y = z_four
+            # NO NORMALIZATION - use z_four directly as condition
+            y = z_four
             
             # Sample from standard normal for source
             z0 = torch.randn(num_samples, self.encoding_dim, device=device)
@@ -211,11 +181,8 @@ class MaskDualVAECNF(nn.Module):
             # We only need the first encoding_dim dimensions (the actual latent code)
             z_img_generated = z_img_generated[:, :self.encoding_dim]
             
-            # De-normalize if needed
-            if self.cnf_norm and hasattr(self, '_x0_mean') and hasattr(self, '_x0_std'):
-                z_img_generated = z_img_generated * self._x0_std + self._x0_mean
-            
-            # Concatenate and decode
+            # NO DE-NORMALIZATION since we never normalized!
+            # Just concatenate and decode
             z_combined = torch.cat([z_img_generated, z_four], dim=1)
             generated_images = self.vae.decoder(z_combined)
             
@@ -312,12 +279,14 @@ def compute_total_loss(reconstruction, target, mu_img, logvar_img,
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Testing ENHANCED MaskDualVAECNF (Optional CNF Normalization)")
+    print("Testing FIXED MaskDualVAECNF (No Redundant Normalization)")
     print("=" * 70)
+    
+    # This requires importing actual components
+    # For now, we'll just verify the class structure
     
     print("\nModel class structure:")
     print(f"  Class name: MaskDualVAECNF")
-    print(f"  New parameter: cnf_norm (default=False)")
     print(f"  Methods:")
     for method_name in dir(MaskDualVAECNF):
         if not method_name.startswith('_') and callable(getattr(MaskDualVAECNF, method_name)):
@@ -328,12 +297,11 @@ if __name__ == "__main__":
     print("  - compute_total_loss")
     
     print("\n" + "=" * 70)
-    print("ENHANCEMENTS:")
+    print("CRITICAL FIX APPLIED:")
     print("=" * 70)
-    print("  ✓ Added cnf_norm parameter (default: False)")
-    print("  ✓ cnf_norm=False: NO normalization (recommended)")
-    print("  ✓ cnf_norm=True: Normalize with batch statistics (experimental)")
-    print("  ✓ Normalization can be toggled via command line argument")
+    print("  ✓ Removed redundant normalization of VAE latents before CNF")
+    print("  ✓ VAE KL loss already pushes latents toward N(0,1)")
+    print("  ✓ No need to normalize again - this was causing KL explosion")
     print("\n" + "=" * 70)
     print("Model definition complete! ✓")
     print("=" * 70)

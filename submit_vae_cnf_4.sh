@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Job name
-#SBATCH -J mask_vae_cnf
+#SBATCH -J mask_vae_cnf_w_ot_reg_with_grad_clip
 
 # Request GPU partition and 1 GPU
 #SBATCH -p gpu --gres=gpu:1
@@ -16,10 +16,10 @@
 #SBATCH -t 24:00:00
 
 # Output file
-#SBATCH -o mask_vae_cnf-%j.out
+#SBATCH -o mask_vae_cnf_w_ot_reg_with_grad_clip-%j.out
 
 # Error file
-#SBATCH -e mask_vae_cnf-%j.err
+#SBATCH -e mask_vae_cnf_w_ot_reg_with_grad_clip-%j.err
 
 # Email notifications (optional - uncomment and add your email)
 #SBATCH --mail-type=ALL
@@ -41,6 +41,6 @@ echo "Running on host: $(hostname)"
 echo "Using GPU: $CUDA_VISIBLE_DEVICES"
 
 # Run the training script
-python3 train_masked_vae_cnf.py --num_epochs 500 --use_kl_annealing
+python3 train_masked_vae_cnf.py --num_epochs 500 --use_kl_annealing --ot_flow_regular 0.1 --gradient_clipping --clip_value 1.0
 
 echo "Job completed"
